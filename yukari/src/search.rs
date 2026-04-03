@@ -479,6 +479,17 @@ impl Thread {
                 }
             }
 
+            // Late Move Pruning
+            let lmp_threshold = 7 + (depth * depth);
+            if !self.board[ply].in_check()
+                && !m.is_capture()
+                && depth == 1
+                && movecount >= lmp_threshold as usize
+                && best > -MATE_VALUE + 500
+            {
+                continue;
+            }
+
             let mut extension = 0;
 
             // Singular extension: is the TT move uniquely good?
@@ -511,7 +522,7 @@ impl Thread {
             }
 
             self.nodes += 1;
-
+            
             self.path.push(Some((self.board[ply].piece_from_square(m.from).unwrap(), *m)));
 
             if self.board.len() <= ply + 1 {
