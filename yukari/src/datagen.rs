@@ -7,7 +7,7 @@ use std::{
 
 use rand::seq::IteratorRandom;
 use tinyvec::ArrayVec;
-use yukari_movegen::{Board, Colour, File, Move, Piece, Rank, Square};
+use yukari_movegen::{Board, Colour, File, Move, MoveType, Piece, Rank, Square};
 
 use crate::search;
 
@@ -96,11 +96,11 @@ struct ViriMove(u16);
 
 impl From<Move> for ViriMove {
     fn from(m: Move) -> Self {
-        let (from, dest) = if let yukari_movegen::MoveType::Castle = m.kind {
+        let (from, dest) = if matches!(m.kind(), MoveType::KingsideCastle | MoveType::QueensideCastle) {
             // convert from yukari's "king two squares" castling to viridithas' "king takes rook" castling.
-            let rank = Rank::from(m.dest);
-            let file = File::from(m.dest);
-            let from = u16::from(m.from.into_inner());
+            let rank = Rank::from(m.dest());
+            let file = File::from(m.dest());
+            let from = u16::from(m.from().into_inner());
             let dest = match (rank, file) {
                 (Rank::One, File::G) => u16::from(Square::from_rank_file(Rank::One, File::H).into_inner()),
                 (Rank::One, File::C) => u16::from(Square::from_rank_file(Rank::One, File::A).into_inner()),
@@ -110,9 +110,9 @@ impl From<Move> for ViriMove {
             };
             (from, dest)
         } else {
-            (u16::from(m.from.into_inner()), u16::from(m.dest.into_inner()))
+            (u16::from(m.from().into_inner()), u16::from(m.dest().into_inner()))
         };
-        let prom = match m.prom {
+        let prom = match m.promotion_piece() {
             None => 0,
             Some(Piece::Knight) => 0,
             Some(Piece::Bishop) => 1,
@@ -120,14 +120,23 @@ impl From<Move> for ViriMove {
             Some(Piece::Queen) => 3,
             Some(_) => unreachable!("invalid promotion piece"),
         };
-        let flags = match m.kind {
+        let flags = match m.kind() {
             yukari_movegen::MoveType::Normal => 0,
             yukari_movegen::MoveType::Capture => 0,
-            yukari_movegen::MoveType::Castle => 2,
+            yukari_movegen::MoveType::KingsideCastle => 2,
+            yukari_movegen::MoveType::QueensideCastle => 2,
             yukari_movegen::MoveType::DoublePush => 0,
             yukari_movegen::MoveType::EnPassant => 1,
-            yukari_movegen::MoveType::Promotion => 3,
-            yukari_movegen::MoveType::CapturePromotion => 3,
+            yukari_movegen::MoveType::PromotionKnight => 3,
+            yukari_movegen::MoveType::PromotionBishop => 3,
+            yukari_movegen::MoveType::PromotionRook => 3,
+            yukari_movegen::MoveType::PromotionQueen => 3,
+            yukari_movegen::MoveType::CapturePromotionKnight => 3,
+            yukari_movegen::MoveType::CapturePromotionBishop => 3,
+            yukari_movegen::MoveType::CapturePromotionRook => 3,
+            yukari_movegen::MoveType::CapturePromotionQueen => 3,
+            yukari_movegen::MoveType::_Unused1 => 0,
+            yukari_movegen::MoveType::_Unused2 => 0,
         };
 
         Self(from | (dest << 6) | (prom << 12) | (flags << 14))
@@ -168,42 +177,28 @@ impl ViriFormat {
 
 pub struct DataGen<'a, T: Write> {
     f: &'a Mutex<T>,
+    search: search::Search,
     rng: rand::rngs::ThreadRng,
-    params: search::SearchParams,
-    tt: Vec<search::TtEntry>,
-    history: Box<[[[i16; 64]; 64]; 12]>,
-    corrhist_p: Box<[[i32; 16384]; 2]>,
-    corrhist_kbn: Box<[[i32; 16384]; 2]>,
-    corrhist_kqr: Box<[[i32; 16384]; 2]>,
-    corrhist_kqrbn_w: Box<[[i32; 16384]; 2]>,
-    corrhist_kqrbn_b: Box<[[i32; 16384]; 2]>,
-    conthist: Box<[[i16; 2 * 6 * 64]; 2 * 6 * 64]>,
     positions: usize,
 }
 
 impl<'a, T: Write> DataGen<'a, T> {
     pub fn new(f: &'a Mutex<T>) -> DataGen<'a, T> {
-        Self {
+        let mut this = Self {
             f,
+            search: search::Search::new(1),
             rng: rand::rng(),
-            params: search::SearchParams::default(),
-            tt: search::allocate_tt(16),
-            history: Box::new([[[0; 64]; 64]; 12]),
-            corrhist_p: Box::new([[0; 16384]; 2]),
-            corrhist_kbn: Box::new([[0; 16384]; 2]),
-            corrhist_kqr: Box::new([[0; 16384]; 2]),
-            corrhist_kqrbn_w: Box::new([[0; 16384]; 2]),
-            corrhist_kqrbn_b: Box::new([[0; 16384]; 2]),
-            conthist: Box::new([[0; 2 * 6 * 64]; 2 * 6 * 64]),
             positions: 0,
-        }
+        };
+        this.search.allocate_tt(16);
+        this
     }
 
     #[must_use]
     fn find_move(&self, board: &Board, from: Square, dest: Square, prom: Option<Piece>) -> Option<Move> {
         let mut moves = ArrayVec::new();
         board.generate(&mut moves);
-        moves.into_iter().find(|&m| m.from == from && m.dest == dest && m.prom == prom)
+        moves.into_iter().find(|&m| m.from() == from && m.dest() == dest && m.promotion_piece() == prom)
     }
 
     pub fn test1(&mut self) {
@@ -253,42 +248,18 @@ impl<'a, T: Write> DataGen<'a, T> {
         self.positions
     }
 
-    fn search(&mut self, board: Board, keystack: &mut Vec<u64>, node_limit: bool) -> Option<(Move, i16)> {
+    fn search(&mut self, board: Board, keystack: &[u64], node_limit: bool) -> Option<(Move, i16)> {
         let start = Instant::now();
         let stop_after = start + Duration::from_secs_f32(if node_limit { 0.25 } else { 2.0 });
-        let mut s = search::Search::new(
-            Some(stop_after),
-            &self.tt,
-            &mut self.history,
-            &mut self.corrhist_p,
-            &mut self.corrhist_kbn,
-            &mut self.corrhist_kqr,
-            &mut self.corrhist_kqrbn_w,
-            &mut self.corrhist_kqrbn_b,
-            &mut self.conthist,
-            &self.params,
-        );
-        let mut pv = ArrayVec::new();
+        let mut pv = Vec::new();
         let mut score = 0;
-        let mut lower_bound = 50;
-        let mut upper_bound = 50;
+
+        self.search.prepare(&board, Some(stop_after), None, keystack);
+
         for depth in 0..=63 {
-            loop {
-                pv.set_len(0);
-                let lower_window = score - lower_bound;
-                let upper_window = score + upper_bound;
-                score = s.search_root(&board, depth, lower_window, upper_window, &mut pv, keystack);
-                if score <= lower_window {
-                    lower_bound *= 2;
-                    continue;
-                }
-                if score >= upper_window {
-                    upper_bound *= 2;
-                    continue;
-                }
-                break;
-            }
-            if node_limit && (s.nodes() + s.qnodes()) > 5_000 {
+            pv.clear();
+            score = self.search.search(depth, -i32::MAX, i32::MAX, &mut pv);
+            if node_limit && (self.search.nodes() + self.search.qnodes()) > 5_000 {
                 break;
             }
             if !node_limit && depth == 10 {
@@ -337,7 +308,7 @@ impl<'a, T: Write> DataGen<'a, T> {
         // Check: the "opening" must not be excessively lopsided.
         let mut game = {
             let yukari_board = yukari_board_stack.last_mut().unwrap();
-            let Some((_, score)) = self.search(yukari_board.clone(), &mut keystack, false) else {
+            let Some((_, score)) = self.search(yukari_board.clone(), &keystack, false) else {
                 // checkmate???
                 return false;
             };
@@ -416,7 +387,7 @@ impl<'a, T: Write> DataGen<'a, T> {
             yukari_board_stack.push(yukari_board_stack.last().unwrap().clone());
             let yukari_board = yukari_board_stack.last_mut().unwrap();
 
-            let Some((m, score)) = self.search(yukari_board.clone(), &mut keystack, true) else {
+            let Some((m, score)) = self.search(yukari_board.clone(), &keystack, true) else {
                 eprintln!("search did not find a move on board {yukari_board}");
                 return false;
             };

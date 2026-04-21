@@ -1,58 +1,10 @@
-use std::{cmp::Ordering, sync::atomic::AtomicU64, time::Instant};
+use std::{cmp::Ordering, sync::{Arc, atomic::{self, AtomicBool, AtomicU64}}, time::Instant, fmt::Write};
 
+use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
 use tinyvec::ArrayVec;
 use yukari_movegen::{Board, Colour, Move, Piece};
 
 const MATE_VALUE: i32 = 10_000;
-
-#[derive(Clone)]
-pub struct SearchParams {
-    pub rfp_margin_base: i32,
-    pub rfp_margin_mul: i32,
-    pub razor_margin_mul: i32,
-    pub lmr_base: f32,
-    pub lmr_mul: f32,
-    pub hist_bonus_base: i32,
-    pub hist_bonus_mul: i32,
-    pub hist_pen_base: i32,
-    pub hist_pen_mul: i32,
-    pub lmp_base: i32,
-    pub lmp_mul: i32,
-    pub lmp_pow: u32,
-    pub see_pruning_capture: f32,
-    pub see_pruning_quiet: f32,
-    pub corrhist_p_weight: i32,
-    pub corrhist_kbn_weight: i32,
-    pub corrhist_kqr_weight: i32,
-    pub corrhist_kqrbn_stm_weight: i32,
-    pub corrhist_kqrbn_nstm_weight: i32,
-}
-
-impl Default for SearchParams {
-    fn default() -> Self {
-        Self {
-            rfp_margin_base: 3,
-            rfp_margin_mul: 36,
-            razor_margin_mul: 246,
-            lmr_base: 1.018_642_9,
-            lmr_mul: 0.521_101_53,
-            hist_bonus_base: 260,
-            hist_bonus_mul: 303,
-            hist_pen_base: 251,
-            hist_pen_mul: 298,
-            lmp_base: 5,
-            lmp_mul: 1,
-            lmp_pow: 2,
-            see_pruning_capture: 0.489_161_5,
-            see_pruning_quiet: 0.006_385_347,
-            corrhist_p_weight: 1024,
-            corrhist_kbn_weight: 1024,
-            corrhist_kqr_weight: 1024,
-            corrhist_kqrbn_stm_weight: 1024,
-            corrhist_kqrbn_nstm_weight: 1024,
-        }
-    }
-}
 
 // TODO: when 50-move rule is implemented, this can be limited to searching from the last irreversible move.
 #[must_use]
@@ -82,28 +34,11 @@ struct TtData {
     depth: u8,
     score: i16,
     m: Option<Move>,
+    eval: i16,
 }
 
 const _TT_ENTRY_IS_16_BYTE: () = assert!(std::mem::size_of::<TtEntry>() == 16);
 const _TT_DATA_IS_8_BYTE: () = assert!(std::mem::size_of::<TtData>() == 8);
-
-pub fn allocate_tt(megabytes: usize) -> Vec<TtEntry> {
-    let target_bytes = megabytes * 1024 * 1024;
-
-    let mut size = 1_usize;
-    loop {
-        if size > target_bytes {
-            break;
-        }
-        size *= 2;
-    }
-    size /= 2;
-    size /= std::mem::size_of::<TtEntry>();
-
-    let mut tt: Vec<TtEntry> = Vec::new();
-    tt.resize_with(size, Default::default);
-    tt
-}
 
 #[derive(PartialEq, Eq, Copy, Clone, Debug, Default)]
 enum MoveOrder {
@@ -150,230 +85,223 @@ impl Ord for MoveOrder {
 
 impl MoveOrder {
     pub fn classify(
-        board: &Board, history: &[[[i16; 64]; 64]; 12], conthist: &[[i16; 2 * 6 * 64]; 2 * 6 * 64], tt_move: Option<Move>,
-        last_last_m: Option<(Piece, Move)>, last_m: Option<(Piece, Move)>, m: Move,
+        board: &Board, tt_move: Option<Move>, history: &[[[i16; 64]; 64]; 12], conthist: &[[i16; 2 * 6 * 64]; 2 * 6 * 64], last_last_m: Option<(Piece, Move)>, last_m: Option<(Piece, Move)>, m: Move,
     ) -> Self {
-        if let Some(tt_move) = tt_move
-            && tt_move == m
-        {
+        if let Some(tt_move) = tt_move && tt_move == m {
             return Self::TtMove;
         }
 
         if m.is_capture() {
-            let dest_piece = board.piece_from_square(m.dest).unwrap_or(Piece::Pawn);
-            let from_piece = board.piece_from_square(m.from).unwrap();
+            let dest_piece = board.piece_from_square(m.dest()).unwrap_or(Piece::Pawn);
+            let from_piece = board.piece_from_square(m.from()).unwrap();
             if (dest_piece >= from_piece) || board.static_exchange_evaluation(m) >= 0 {
                 return Self::GoodCapture(dest_piece, from_piece);
             }
             return Self::BadCapture(dest_piece, from_piece);
         }
 
-        let coloured_piece = 6 * usize::from(board.side() == Colour::Black) + board.piece_from_square(m.from).unwrap() as usize;
-        let mut score = i32::from(history[coloured_piece][m.from.into_inner() as usize][m.dest.into_inner() as usize]);
+        let coloured_piece = 6 * usize::from(board.side() == Colour::Black) + board.piece_from_square(m.from()).unwrap() as usize;
+        let mut score = i32::from(history[coloured_piece][m.from().into_inner() as usize][m.dest().into_inner() as usize]);
         if let Some((last_piece, last_m)) = last_last_m {
             let last_index = 6 * 64 * usize::from(board.side() == Colour::Black)
                 + 64 * (last_piece as usize)
-                + usize::from(last_m.dest.into_inner());
+                + usize::from(last_m.dest().into_inner());
             let curr_index = 6 * 64 * usize::from(board.side() == Colour::Black)
-                + 64 * (board.piece_from_square(m.from).unwrap() as usize)
-                + usize::from(m.dest.into_inner());
+                + 64 * (board.piece_from_square(m.from()).unwrap() as usize)
+                + usize::from(m.dest().into_inner());
             score += i32::from(conthist[last_index][curr_index]);
         }
         if let Some((last_piece, last_m)) = last_m {
             let last_index = 6 * 64 * usize::from(board.side() == Colour::Black)
                 + 64 * (last_piece as usize)
-                + usize::from(last_m.dest.into_inner());
+                + usize::from(last_m.dest().into_inner());
             let curr_index = 6 * 64 * usize::from(board.side() == Colour::Black)
-                + 64 * (board.piece_from_square(m.from).unwrap() as usize)
-                + usize::from(m.dest.into_inner());
+                + 64 * (board.piece_from_square(m.from()).unwrap() as usize)
+                + usize::from(m.dest().into_inner());
             score += i32::from(conthist[last_index][curr_index]);
         }
         Self::Quiet(score)
     }
 }
 
-pub struct Search<'a> {
-    nodes: u64,
-    qnodes: u64,
-    zw_nodes: u64,
-    zw_qnodes: u64,
-    seldepth: i32,
-    nullmove_attempts: u64,
-    nullmove_success: u64,
-    beta_cutoff_index: u64,
-    beta_cutoffs: u64,
-    q_beta_cutoff_index: u64,
-    q_beta_cutoffs: u64,
-    hash_probes: u64,
-    hash_hits: u64,
-    hash_cutoffs: u64,
-    stop_after: Option<Instant>,
-    history: &'a mut [[[i16; 64]; 64]; 12],
-    tt: &'a [TtEntry],
-    corrhist_p: &'a mut [[i32; 16384]; 2],
-    corrhist_kbn: &'a mut [[i32; 16384]; 2],
-    corrhist_kqr: &'a mut [[i32; 16384]; 2],
-    corrhist_kqrbn_w: &'a mut [[i32; 16384]; 2],
-    corrhist_kqrbn_b: &'a mut [[i32; 16384]; 2],
-    conthist: &'a mut [[i16; 2 * 6 * 64]; 2 * 6 * 64],
-    path: ArrayVec<[Option<(Piece, Move)>; 64]>,
-    eval: ArrayVec<[Option<i32>; 64]>,
-    params: &'a SearchParams,
+#[derive(Clone)]
+pub struct MpcModel {
+    pub a: f32,
+    pub sigma: i32,
+    pub s: i32,
 }
 
-impl<'a> Search<'a> {
-    #[must_use]
-    pub fn new(
-        stop_after: Option<Instant>, tt: &'a [TtEntry], history: &'a mut [[[i16; 64]; 64]; 12],
-        corrhist_p: &'a mut [[i32; 16384]; 2], corrhist_kbn: &'a mut [[i32; 16384]; 2], corrhist_kqr: &'a mut [[i32; 16384]; 2],
-        corrhist_kqrbn_w: &'a mut [[i32; 16384]; 2], corrhist_kqrbn_b: &'a mut [[i32; 16384]; 2],
-        conthist: &'a mut [[i16; 2 * 6 * 64]; 2 * 6 * 64], params: &'a SearchParams,
-    ) -> Self {
+impl MpcModel {
+    pub fn display_xboard(&self, depth: usize, bucket: usize) {
+        println!("feature option=\"MpcS{}D{depth}B{bucket}A -string {:.3}\"", self.s, self.a);
+        println!("feature option=\"MpcS{}D{depth}B{bucket}Sigma -spin {} 0 200\"", self.s, self.sigma);
+    }
+
+    pub fn display_openbench(&self, depth: usize, bucket: usize) {
+        println!("MpcS{}D{depth}B{bucket}A, float, {}, 1.0, 1.1, 0.005, 0.002", self.s, self.a);
+        println!("MpcS{}D{depth}B{bucket}Sigma, int, {}, 0, 100, 5, 0.002", self.s, self.sigma);
+    }
+
+    pub fn display_rust(&self) {
+        println!("    MpcModel {{ a: {:.3}, sigma: {}, s: {} }},", self.a, self.sigma, self.s);
+    }
+
+    pub fn parse(&mut self, depth: usize, bucket: usize, name: &str, value: &str) {
+        let mut prefix = String::new();
+        write!(prefix, "MpcS{}D{depth}B{bucket}", self.s).unwrap();
+        if !name.starts_with(&prefix) {
+            return;
+        }
+        let name = &name[prefix.len() ..];
+        if name == "A" {
+            self.a = value.parse::<f32>().unwrap();
+            println!("# {prefix}A = {}", self.a);
+        } else if name == "Sigma" {
+            self.sigma = value.parse::<i32>().unwrap();
+            println!("# {prefix}Sigma = {}", self.sigma);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SearchParams {
+    pub mpc_model: [[MpcModel; 4]; 5]
+}
+
+impl Default for SearchParams {
+    fn default() -> Self {
         Self {
-            nodes: 0,
-            qnodes: 0,
-            zw_nodes: 0,
-            zw_qnodes: 0,
-            seldepth: 0,
-            nullmove_attempts: 0,
-            nullmove_success: 0,
-            beta_cutoff_index: 0,
-            beta_cutoffs: 0,
-            q_beta_cutoff_index: 0,
-            q_beta_cutoffs: 0,
-            hash_probes: 0,
-            hash_hits: 0,
-            hash_cutoffs: 0,
-            stop_after,
-            history,
-            tt,
-            corrhist_p,
-            corrhist_kbn,
-            corrhist_kqr,
-            corrhist_kqrbn_w,
-            corrhist_kqrbn_b,
-            conthist,
-            path: ArrayVec::new(),
-            eval: ArrayVec::new(),
-            params,
+            mpc_model: [
+                [ // depth: 1
+                    MpcModel { a: 1.039, sigma: 22, s: 0 },
+                    MpcModel { a: 1.056, sigma: 47, s: 0 },
+                    MpcModel { a: 1.019, sigma: 42, s: 0 },
+                    MpcModel { a: 1.018, sigma: 24, s: 0 },
+                ],
+                [ // depth: 2
+                    MpcModel { a: 1.043, sigma: 48, s: 0 },
+                    MpcModel { a: 1.049, sigma: 68, s: 0 },
+                    MpcModel { a: 1.026, sigma: 47, s: 0 },
+                    MpcModel { a: 1.035, sigma: 36, s: 0 },
+                ],
+                [ // depth: 3
+                    MpcModel { a: 1.067, sigma: 74, s: 0 },
+                    MpcModel { a: 1.092, sigma: 81, s: 0 },
+                    MpcModel { a: 1.048, sigma: 69, s: 0 },
+                    MpcModel { a: 1.054, sigma: 55, s: 0 },
+                ],
+                [ // depth: 4
+                    MpcModel { a: 1.065, sigma: 65, s: 1 },
+                    MpcModel { a: 1.028, sigma: 76, s: 1 },
+                    MpcModel { a: 1.023, sigma: 71, s: 1 },
+                    MpcModel { a: 1.033, sigma: 56, s: 1 },
+                ],
+                [ // depth: 5
+                    MpcModel { a: 1.088, sigma: 62, s: 1 },
+                    MpcModel { a: 1.055, sigma: 71, s: 1 },
+                    MpcModel { a: 1.050, sigma: 86, s: 1 },
+                    MpcModel { a: 1.035, sigma: 61, s: 1 },
+                ]
+            ]
+        }
+    }
+}
+
+impl SearchParams {
+    pub fn display_xboard(&self) {
+        for depth in 0..=4 {
+            for bucket in 0..=3 {
+                self.mpc_model[depth][bucket].display_xboard(depth + 1, bucket);
+            }
         }
     }
 
-    fn update_corrhist(&mut self, board: &Board, depth: i32, diff: i32) {
-        const CORRHIST_GRAIN: i32 = 256;
-        const CORRHIST_WEIGHT_SCALE: i32 = 256;
-        const CORRHIST_MAX: i32 = 256 * 32;
+    pub fn display_openbench(&self) {
+        for depth in 0..=4 {
+            for bucket in 0..=3 {
+                self.mpc_model[depth][bucket].display_openbench(depth + 1, bucket);
+            }
+        }
+    }
 
-        let diff = diff * CORRHIST_GRAIN;
-        let weight = 16.min(depth + 1);
+    pub fn display_rust(&self) {
+        for depth in 0..=4 {
+            println!("[ // depth: {}", depth + 1);
+            for bucket in 0..=3 {
+                self.mpc_model[depth][bucket].display_rust();
+            }
+            println!("],")
+        }
+    }
+
+    pub fn parse(&mut self, name: &str, value: &str) {
+        for depth in 0..=4 {
+            for bucket in 0..=3 {
+                self.mpc_model[depth][bucket].parse(depth + 1, bucket, name, value);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+#[repr(align(64))]
+struct Thread {
+    params: SearchParams,
+    nodes: u64,
+    qnodes: u64,
+    seldepth: usize,
+    stop: Arc<AtomicBool>,
+    stop_after: Option<Instant>,
+    node_limit: Option<u64>,
+    board: Vec<Board>,
+    pv: Vec<Vec<Move>>,
+    keystack: Vec<u64>,
+    index: usize,
+    history: [[[i16; 64]; 64]; 12],
+    conthist: [[i16; 2 * 6 * 64]; 2 * 6 * 64],
+    corrhist_p: [[i32; 16384]; 2],
+    corrhist_kbn: [[i32; 16384]; 2],
+    path: Vec<Option<(Piece, Move)>>,
+}
+
+impl Thread {
+    fn eval(&self, ply: usize) -> i32 {
+        const CORRHIST_GRAIN: i32 = 256;
+
+        let eval = self.board[ply].eval(self.board[ply].side());
 
         // pawns
-        let entry_p = &mut self.corrhist_p[board.side() as usize][board.data().hash_pawns() as usize & 16383];
-
-        *entry_p = ((*entry_p * (CORRHIST_WEIGHT_SCALE - weight) + diff * weight) / CORRHIST_WEIGHT_SCALE)
-            .clamp(-CORRHIST_MAX, CORRHIST_MAX);
-
-        // nonpawns (white)
-        let entry_kqrbn_w =
-            &mut self.corrhist_kqrbn_w[board.side() as usize][board.data().hash_nonpawn(Colour::White) as usize & 16383];
-
-        *entry_kqrbn_w = ((*entry_kqrbn_w * (CORRHIST_WEIGHT_SCALE - weight) + diff * weight) / CORRHIST_WEIGHT_SCALE)
-            .clamp(-CORRHIST_MAX, CORRHIST_MAX);
-
-        // nonpawns (black)
-        let entry_kqrbn_b =
-            &mut self.corrhist_kqrbn_b[board.side() as usize][board.data().hash_nonpawn(Colour::Black) as usize & 16383];
-
-        *entry_kqrbn_b = ((*entry_kqrbn_b * (CORRHIST_WEIGHT_SCALE - weight) + diff * weight) / CORRHIST_WEIGHT_SCALE)
-            .clamp(-CORRHIST_MAX, CORRHIST_MAX);
-
+        let entry_p = self.corrhist_p[self.board[ply].side() as usize][self.board[ply].hash_pawns() as usize & 16383];
         // kings, bishops, knights
-        let entry_kbn = &mut self.corrhist_kbn[board.side() as usize][board.data().hash_kbn() as usize & 16383];
-
-        *entry_kbn = ((*entry_kbn * (CORRHIST_WEIGHT_SCALE - weight) + diff * weight) / CORRHIST_WEIGHT_SCALE)
-            .clamp(-CORRHIST_MAX, CORRHIST_MAX);
-
-        // kings, queens, rooks
-        let entry_kqr = &mut self.corrhist_kqr[board.side() as usize][board.data().hash_kqr() as usize & 16383];
-
-        *entry_kqr = ((*entry_kqr * (CORRHIST_WEIGHT_SCALE - weight) + diff * weight) / CORRHIST_WEIGHT_SCALE)
-            .clamp(-CORRHIST_MAX, CORRHIST_MAX);
+        let entry_kbn = self.corrhist_kbn[self.board[ply].side() as usize][self.board[ply].data().hash_kbn() as usize & 16383];
+        let corrhist = (entry_p + entry_kbn) / CORRHIST_GRAIN;
+        (eval + corrhist).clamp(-MATE_VALUE + 501, MATE_VALUE - 501)
     }
 
-    fn eval_with_corrhist(&self, board: &Board, eval: i32) -> i32 {
-        const CORRHIST_GRAIN: i32 = 256;
-
-        let corrhist_w_weight = if board.side() == Colour::White { self.params.corrhist_kqrbn_stm_weight } else { self.params.corrhist_kqrbn_nstm_weight };
-        let corrhist_b_weight = if board.side() == Colour::Black { self.params.corrhist_kqrbn_stm_weight } else { self.params.corrhist_kqrbn_nstm_weight };
-
-        let entry_p = self.corrhist_p[board.side() as usize][board.hash_pawns() as usize & 16383] * self.params.corrhist_p_weight / 1024;
-        let entry_kbn = self.corrhist_kbn[board.side() as usize][board.data().hash_kbn() as usize & 16383] * self.params.corrhist_kbn_weight / 1024;
-        let entry_kqr = self.corrhist_kqr[board.side() as usize][board.data().hash_kqr() as usize & 16383] * self.params.corrhist_kqr_weight / 1024;
-        let entry_kqrbn_w = self.corrhist_kqrbn_w[board.side() as usize][board.data().hash_nonpawn(Colour::White) as usize & 16383] * corrhist_w_weight / 1024;
-        let entry_kqrbn_b = self.corrhist_kqrbn_b[board.side() as usize][board.data().hash_nonpawn(Colour::Black) as usize & 16383] * corrhist_b_weight / 1024;
-        let corrhist = (entry_p + entry_kbn + entry_kqr + entry_kqrbn_w + entry_kqrbn_b) / CORRHIST_GRAIN;
-        (eval + corrhist).clamp(-MATE_VALUE + 1, MATE_VALUE - 1)
-    }
-
-    fn update_history(
-        &mut self, board: &Board, last_last_m: Option<(Piece, Move)>, last_m: Option<(Piece, Move)>, m: Move, bonus: i32,
-    ) {
-        const HISTORY_MAX: i32 = 16384;
-        let bonus = bonus.clamp(-HISTORY_MAX, HISTORY_MAX);
-        {
-            let coloured_piece = 6 * usize::from(board.side() == Colour::Black) + board.piece_from_square(m.from).unwrap() as usize;
-            let history = &mut self.history[coloured_piece][m.from.into_inner() as usize][m.dest.into_inner() as usize];
-            let bonus = bonus - i32::from(*history) * bonus.abs() / HISTORY_MAX;
-            *history += bonus as i16;
-        }
-        if let Some((last_piece, last_m)) = last_last_m {
-            let last_index = 6 * 64 * usize::from(board.side() == Colour::Black)
-                + 64 * (last_piece as usize)
-                + usize::from(last_m.dest.into_inner());
-            let curr_index = 6 * 64 * usize::from(board.side() == Colour::Black)
-                + 64 * (board.piece_from_square(m.from).unwrap() as usize)
-                + usize::from(m.dest.into_inner());
-            let conthist = &mut self.conthist[last_index][curr_index];
-            let bonus = bonus - i32::from(*conthist) * bonus.abs() / HISTORY_MAX;
-            *conthist += bonus as i16;
-        }
-        if let Some((last_piece, last_m)) = last_m {
-            let last_index = 6 * 64 * usize::from(board.side() == Colour::Black)
-                + 64 * (last_piece as usize)
-                + usize::from(last_m.dest.into_inner());
-            let curr_index = 6 * 64 * usize::from(board.side() == Colour::Black)
-                + 64 * (board.piece_from_square(m.from).unwrap() as usize)
-                + usize::from(m.dest.into_inner());
-            let conthist = &mut self.conthist[last_index][curr_index];
-            let bonus = bonus - i32::from(*conthist) * bonus.abs() / HISTORY_MAX;
-            *conthist += bonus as i16;
-        }
-    }
-
-    fn quiesce(&mut self, board: &Board, mut alpha: i32, beta: i32, pv: &mut ArrayVec<[Move; 64]>, ply: i32) -> i32 {
+    pub fn quiesce(&mut self, mut alpha: i32, beta: i32, ply: usize, tt: &[TtEntry]) -> i32 {
         let expected_pvnode = alpha != beta - 1;
-        let mut best_score = self.eval_with_corrhist(board, board.eval(board.side()));
 
-        pv.set_len(0);
+        if self.pv.len() <= ply {
+            self.pv.push(Vec::new());
+        } else {
+            self.pv[ply].clear();
+        }
 
         self.seldepth = self.seldepth.max(ply);
 
-        // Emergency bailout
-        if ply == 63 {
-            return best_score;
+        let mut best = self.eval(ply);
+        if best >= beta {
+            return best;
         }
+        alpha = alpha.max(best);
 
-        if best_score >= beta {
-            return best_score;
-        }
-        alpha = alpha.max(best_score);
-
-        if let Some(entry) = self.probe_tt(board, 0)
-            && !expected_pvnode
-        {
+        let tt_entry = self.probe_tt(tt, &self.board[ply], ply);
+        if let Some(entry) = tt_entry && !expected_pvnode {
             let score = i32::from(entry.score);
             match entry.flags {
-                TtFlags::Exact => return score,
+                TtFlags::Exact => {
+                    return score;
+                }
                 TtFlags::Upper => {
                     if score <= alpha {
                         return score;
@@ -387,47 +315,51 @@ impl<'a> Search<'a> {
             }
         }
 
-        let mut index = 0;
-        board.generate_captures_incremental(|m| {
-            self.qnodes += 1;
-            if !expected_pvnode {
-                self.zw_qnodes += 1;
+        let mut moves = ArrayVec::new();
+        self.board[ply].generate_quiesce(&mut moves);
+
+        for m in &moves {
+            if self.board[ply].static_exchange_evaluation(*m) < 0 {
+                continue;
             }
 
-            let board = board.make(m);
-            let mut child_pv = ArrayVec::new();
-            let score = -self.quiesce(&board, -beta, -alpha, &mut child_pv, ply + 1);
+            self.qnodes += 1;
 
-            best_score = best_score.max(score);
+            if self.board.len() <= ply + 1 {
+                self.board.push(self.board[ply].make(*m));
+            } else {
+                self.board[ply+1] = self.board[ply].make(*m);
+            }
 
-            if score >= beta {
-                self.q_beta_cutoff_index += index;
-                self.q_beta_cutoffs += 1;
-                return false;
+            let score = -self.quiesce(-beta, -alpha, ply + 1, tt);
+
+            if score > best {
+                best = score;
+
+                self.pv[ply].clear();
+                self.pv[ply].push(*m);
+                let (this_pv, next_pv) = self.pv.split_at_mut(ply+1);
+                let (this_pv, next_pv) = (this_pv.last_mut().unwrap(), next_pv.first().unwrap());
+                this_pv.extend_from_slice(next_pv);
             }
 
             if score > alpha {
                 alpha = score;
-                pv.set_len(0);
-                pv.push(m);
-                for m in child_pv {
-                    pv.push(m);
-                }
             }
 
-            index += 1;
+            if score >= beta {
+                return score;
+            }
+        }
 
-            true
-        });
-
-        best_score
+        best
     }
 
-    fn probe_tt(&self, board: &Board, ply: i32) -> Option<TtData> {
-        let entry = (board.hash() & ((self.tt.len() - 1) as u64)) as usize;
-        let entry = &self.tt[entry];
-        let entry_key = entry.key.load(std::sync::atomic::Ordering::Relaxed);
-        let entry_data = entry.data.load(std::sync::atomic::Ordering::Relaxed);
+    fn probe_tt(&self, tt: &[TtEntry], board: &Board, ply: usize) -> Option<TtData> {
+        let entry = (board.hash() & ((tt.len() - 1) as u64)) as usize;
+        let entry = &tt[entry];
+        let entry_key = entry.key.load(atomic::Ordering::Acquire);
+        let entry_data = entry.data.load(atomic::Ordering::Acquire);
         let mut entry: TtData = unsafe { std::mem::transmute(entry_data) };
 
         if entry_key ^ entry_data == board.hash() {
@@ -444,31 +376,31 @@ impl<'a> Search<'a> {
 
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
-    fn prefetch_tt(&self, board: &Board, m: Move) {
+    fn prefetch_tt(&self, tt: &[TtEntry], board: &Board, m: Move) {
         use core::arch::aarch64::{_prefetch, _PREFETCH_READ, _PREFETCH_LOCALITY3};
 
-        let entry = (board.hash_after(m) & ((self.tt.len() - 1) as u64)) as usize;
-        let entry = &self.tt[entry];
+        let entry = (board.hash_after(m) & ((tt.len() - 1) as u64)) as usize;
+        let entry = &tt[entry];
         unsafe { _prefetch(entry as *const _ as *const i8, _PREFETCH_READ, _PREFETCH_LOCALITY3) }
     }
 
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    fn prefetch_tt(&self, board: &Board, m: Move) {
+    fn prefetch_tt(&self, tt: &[TtEntry], board: &Board, m: Move) {
         use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 
-        let entry = (board.hash_after(m) & ((self.tt.len() - 1) as u64)) as usize;
-        let entry = &self.tt[entry];
+        let entry = (board.hash_after(m) & ((tt.len() - 1) as u64)) as usize;
+        let entry = &tt[entry];
         unsafe { _mm_prefetch::<_MM_HINT_T0>(entry as *const _ as *const i8) }
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[inline(always)]
-    fn prefetch_tt(&self, board: &Board, m: Move) {}
+    fn prefetch_tt(&self, tt: &[TtEntry], board: &Board, m: Move) {}
 
-    fn write_tt(&self, board: &Board, ply: i32, mut data: TtData) {
-        let entry = (board.hash() & ((self.tt.len() - 1) as u64)) as usize;
-        let entry = &self.tt[entry];
+    fn write_tt(&self, tt: &[TtEntry], board: &Board, ply: usize, mut data: TtData) {
+        let entry = (board.hash() & ((tt.len() - 1) as u64)) as usize;
+        let entry = &tt[entry];
         if i32::from(data.score) >= MATE_VALUE - 500 {
             data.score += ply as i16;
         }
@@ -476,158 +408,181 @@ impl<'a> Search<'a> {
             data.score -= ply as i16;
         }
         let data = unsafe { std::mem::transmute::<TtData, u64>(data) };
-        entry.key.store(board.hash() ^ data, std::sync::atomic::Ordering::Relaxed);
-        entry.data.store(data, std::sync::atomic::Ordering::Relaxed);
+        entry.key.store(board.hash() ^ data, atomic::Ordering::Release);
+        entry.data.store(data, atomic::Ordering::Release);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn search(
-        &mut self, board: &Board, mut depth: i32, mut alpha: i32, beta: i32, pv: &mut ArrayVec<[Move; 64]>, ply: i32,
-        keystack: &mut Vec<u64>, excluded_move: Option<Move>, expected_cutnode: bool,
-    ) -> i32 {
+    fn update_history(
+        &mut self, ply: usize, last_last_m: Option<(Piece, Move)>, last_m: Option<(Piece, Move)>, m: Move, bonus: i32,
+    ) {
+        const HISTORY_MAX: i32 = 16384;
+        let board = &self.board[ply];
+        let bonus = bonus.clamp(-HISTORY_MAX, HISTORY_MAX);
+        // History Heuristic
+        {
+            let coloured_piece = 6 * usize::from(board.side() == Colour::Black) + board.piece_from_square(m.from()).unwrap() as usize;
+            let history = &mut self.history[coloured_piece][m.from().into_inner() as usize][m.dest().into_inner() as usize];
+            let bonus = bonus - i32::from(*history) * bonus.abs() / HISTORY_MAX;
+            *history += bonus as i16;
+        }
+
+        // N-2 Continuation History (Follow Up History)
+        if let Some((last_piece, last_m)) = last_last_m {
+            let last_index = 6 * 64 * usize::from(board.side() == Colour::Black)
+                + 64 * (last_piece as usize)
+                + usize::from(last_m.dest().into_inner());
+            let curr_index = 6 * 64 * usize::from(board.side() == Colour::Black)
+                + 64 * (board.piece_from_square(m.from()).unwrap() as usize)
+                + usize::from(m.dest().into_inner());
+            let conthist = &mut self.conthist[last_index][curr_index];
+            let bonus = bonus - i32::from(*conthist) * bonus.abs() / HISTORY_MAX;
+            *conthist += bonus as i16;
+        }
+
+        // N-1 Continuation History (Counter Move History)
+        if let Some((last_piece, last_m)) = last_m {
+            let last_index = 6 * 64 * usize::from(board.side() == Colour::Black)
+                + 64 * (last_piece as usize)
+                + usize::from(last_m.dest().into_inner());
+            let curr_index = 6 * 64 * usize::from(board.side() == Colour::Black)
+                + 64 * (board.piece_from_square(m.from()).unwrap() as usize)
+                + usize::from(m.dest().into_inner());
+            let conthist = &mut self.conthist[last_index][curr_index];
+            let bonus = bonus - i32::from(*conthist) * bonus.abs() / HISTORY_MAX;
+            *conthist += bonus as i16;
+        }
+    }
+
+    fn update_corrhist(&mut self, ply: usize, depth: i32, diff: i32) {
+        const CORRHIST_GRAIN: i32 = 256;
+        const CORRHIST_WEIGHT_SCALE: i32 = 256;
+        const CORRHIST_MAX: i32 = 256 * 32;
+
+        let diff = diff * CORRHIST_GRAIN;
+        let weight = 16.min(depth + 1);
+
+        // pawns
+        let entry_p = &mut self.corrhist_p[self.board[ply].side() as usize][self.board[ply].data().hash_pawns() as usize & 16383];
+
+        *entry_p = ((*entry_p * (CORRHIST_WEIGHT_SCALE - weight) + diff * weight) / CORRHIST_WEIGHT_SCALE)
+            .clamp(-CORRHIST_MAX, CORRHIST_MAX);
+
+        // kings, bishops, knights
+        let entry_kbn = &mut self.corrhist_kbn[self.board[ply].side() as usize][self.board[ply].data().hash_kbn() as usize & 16383];
+
+        *entry_kbn = ((*entry_kbn * (CORRHIST_WEIGHT_SCALE - weight) + diff * weight) / CORRHIST_WEIGHT_SCALE)
+            .clamp(-CORRHIST_MAX, CORRHIST_MAX);
+    }
+
+    pub fn search(&mut self, depth: i32, mut alpha: i32, beta: i32, ply: usize, tt: &[TtEntry], excluded_move: Option<Move>) -> i32 {
         let expected_pvnode = alpha != beta - 1;
+
+        if self.pv.len() <= ply {
+            self.pv.push(Vec::new());
+        } else {
+            self.pv[ply].clear();
+        }
 
         self.seldepth = self.seldepth.max(ply);
 
-        // Emergency bailout
-        if ply == 63 {
-            pv.set_len(0);
-            return self.eval_with_corrhist(board, board.eval(board.side()));
-        }
-
         // Draw by insufficient material
-        if board.insufficient_material() && ply > 0 {
-            pv.set_len(0);
+        if self.board[ply].insufficient_material() && ply > 0 {
             return 0;
         }
 
         // Is this a repetition draw?
-        if is_repetition_draw(keystack, board.hash()) && ply > 0 {
-            pv.set_len(0);
+        if is_repetition_draw(&self.keystack, self.board[ply].hash()) && ply > 0 {
             return 0;
         }
 
-        // Check extension
-        if board.in_check() {
-            depth += 1;
-        }
-
         if depth <= 0 {
-            return self.quiesce(board, alpha, beta, pv, ply);
+            return self.quiesce(alpha, beta, ply, tt);
         }
 
-        pv.set_len(0);
-
-        self.hash_probes += 1;
-        let tt_entry = self.probe_tt(board, ply);
-        if let Some(entry) = tt_entry {
-            self.hash_hits += 1;
-            if excluded_move.is_none() && !expected_pvnode && i32::from(entry.depth) >= depth {
-                let score = i32::from(entry.score);
-                match entry.flags {
-                    TtFlags::Exact => {
-                        self.hash_cutoffs += 1;
+        let tt_entry = self.probe_tt(tt, &self.board[ply], ply);
+        if let Some(entry) = tt_entry && excluded_move.is_none() && !expected_pvnode && i32::from(entry.depth) >= depth {
+            let score = i32::from(entry.score);
+            match entry.flags {
+                TtFlags::Exact => {
+                    return score;
+                }
+                TtFlags::Upper => {
+                    if score <= alpha {
                         return score;
                     }
-                    TtFlags::Upper => {
-                        if score <= alpha {
-                            self.hash_cutoffs += 1;
-                            return score;
-                        }
-                    }
-                    TtFlags::Lower => {
-                        if score >= beta {
-                            self.hash_cutoffs += 1;
-                            return score;
-                        }
+                }
+                TtFlags::Lower => {
+                    if score >= beta {
+                        return score;
                     }
                 }
             }
         }
 
-        if excluded_move.is_none()
-            && expected_pvnode
-            && (tt_entry.is_none() || i32::from(tt_entry.unwrap().depth) + 3 < depth)
-            && depth >= 3
-        {
-            // internal iterative reduction
-            depth -= 1;
-        }
+        let eval = self.eval(ply);
+        if !self.board[ply].in_check() {
+            let rfp_margin = 45 * depth;
+            if excluded_move.is_none() && depth <= 8 && eval - rfp_margin >= beta {
+                return eval - rfp_margin;
+            }
 
-        // Improving metric: are we doing better than we were two plies ago?
-        let eval_int = self.eval_with_corrhist(board, board.eval(board.side()));
-        let mut improving = false;
-        if !board.in_check() {
-            let last_eval = *self.eval.iter().rev().nth(1).unwrap_or(&None);
-            improving = last_eval.is_some_and(|last_eval| eval_int > last_eval);
-        }
+            let razor_margin = 250 * depth;
+            if excluded_move.is_none() && depth == 1 && alpha.abs() < 2000 && eval + razor_margin <= alpha {
+                let score = self.quiesce(alpha, alpha + 1, ply, tt);
+                if score <= alpha {
+                    return score;
+                }
+            }
 
-        // Reverse futility pruning: is the static eval so good we can prune?
-        let rfp_margin = self.params.rfp_margin_base + self.params.rfp_margin_mul * depth;
-        let rfp_depth = if improving { 5 } else { 4 };
-        if excluded_move.is_none() && !expected_pvnode && !board.in_check() && depth <= rfp_depth && eval_int - rfp_margin >= beta {
-            return eval_int - rfp_margin;
-        }
+            let mpc_model = if depth <= 5 {
+                let piece_count = (self.board[ply].data().piecemask().occupied().count_ones() as usize - 2) / 8;
+                self.params.mpc_model[(depth - 1) as usize][piece_count].clone()
+            } else {
+                MpcModel { a: 0.0, sigma: 0, s: 0}
+            };
 
-        // Razoring: is the static eval so low we can prune, and not improved by a quiescence search?
-        let razor_margin = self.params.razor_margin_mul * depth;
-        if excluded_move.is_none()
-            && !expected_pvnode
-            && !board.in_check()
-            && depth <= 3
-            && alpha.abs() < 2000
-            && eval_int + razor_margin <= alpha
-        {
-            let score = self.quiesce(board, alpha, alpha + 1, pv, ply);
-            if score <= alpha {
-                return score;
+            if excluded_move.is_none() && alpha >= -1000 && beta <= 1000 && !expected_pvnode && depth <= 5 {
+                let bound = ((beta + mpc_model.sigma) as f32 / mpc_model.a).round() as i32;
+                let score = self.search(mpc_model.s, bound - 1, bound, ply, tt, None);
+                if score >= bound {
+                    return beta;
+                }
+            }
+
+            if excluded_move.is_none() && alpha >= -1000 && beta <= 1000 && !expected_pvnode && depth == 1 {
+                let bound = ((alpha - mpc_model.sigma) as f32 / mpc_model.a).round() as i32;
+                let score = self.search(mpc_model.s, bound, bound + 1, ply, tt, None);
+                if score <= bound {
+                    return alpha;
+                }
             }
         }
 
-        // Null-move pruning: can we skip a turn and still come off sufficiently winning we can prune?
-        let reduction = if depth > 10 {
-            5
-        } else if depth > 6 {
-            4
-        } else {
-            3
-        } + ((eval_int - beta) / 200).max(0)
-            + i32::from(improving);
-        if excluded_move.is_none() && !expected_pvnode && !board.in_check() && depth >= 2 && eval_int >= beta {
-            keystack.push(board.hash());
-            let board = board.make_null();
-            let mut child_pv = ArrayVec::new();
+        if excluded_move.is_none() && !expected_pvnode && !self.board[ply].in_check() && depth >= 2 && eval >= beta {
+            self.keystack.push(self.board[ply].hash());
+            if self.board.len() <= ply + 1 {
+                self.board.push(self.board[ply].make_null());
+            } else {
+                self.board[ply+1] = self.board[ply].make_null();
+            }
             self.path.push(None);
-            let score = -self.search(
-                &board,
-                depth - 1 - reduction,
-                -beta,
-                -beta + 1,
-                &mut child_pv,
-                ply + 1,
-                keystack,
-                None,
-                !expected_cutnode,
-            );
+            let reduction = 3;
+            let score = -self.search(depth - 1 - reduction, -beta, -beta + 1, ply + 1, tt, None);
             self.path.pop();
-            keystack.pop();
-
-            self.nullmove_attempts += 1;
+            self.keystack.pop();
 
             if score >= beta {
-                self.nullmove_success += 1;
                 return score;
             }
         }
 
         let mut moves = ArrayVec::new();
-        board.generate(&mut moves);
+        self.board[ply].generate(&mut moves);
 
         // Is this checkmate or stalemate?
         if moves.is_empty() {
-            pv.set_len(0);
-            if board.in_check() {
-                return -MATE_VALUE + ply;
+            if self.board[ply].in_check() {
+                return -MATE_VALUE + (ply as i32);
             }
             return 0;
         }
@@ -639,321 +594,298 @@ impl<'a> Search<'a> {
 
         let mut moves = {
             let tt_move = tt_entry.and_then(|e| e.m);
-            let last_move = *self.path.last().unwrap_or(&None);
-            let last_last_move = *self.path.iter().rev().nth(1).unwrap_or(&None);
+            let last_m = *self.path.last().unwrap_or(&None);
+            let last_last_m = *self.path.iter().rev().nth(1).unwrap_or(&None);
             moves
                 .into_iter()
-                .map(|m| (m, MoveOrder::classify(board, self.history, self.conthist, tt_move, last_last_move, last_move, m)))
+                .map(|m| (m, MoveOrder::classify(&self.board[ply], tt_move, &self.history, &self.conthist, last_last_m, last_m, m)))
                 .collect::<ArrayVec<[(Move, MoveOrder); 256]>>()
         };
         moves.sort_by_key(|(_, order)| *order);
 
-        let mut best_move = None;
-        let mut best_score = i32::MIN;
-        let mut raised_lower_bound = false;
-
-        // Push the move to check for repetition draws
         if excluded_move.is_none() {
-            keystack.push(board.hash());
-            if board.in_check() {
-                self.eval.push(None);
-            } else {
-                self.eval.push(Some(eval_int));
-            }
+            self.keystack.push(self.board[ply].hash());
         }
 
-        for (movecount, (m, _)) in moves.into_iter().enumerate() {
-            if let Some(excluded_move) = excluded_move
-                && excluded_move == m
-            {
+        let mut best = i32::MIN;
+        let mut best_move = None;
+        let mut raised_alpha = false;
+
+        for (movecount, (m, _)) in moves.iter().enumerate() {
+            if Some(*m) == excluded_move {
                 continue;
             }
 
+            self.prefetch_tt(tt, &self.board[ply], *m);
+
             // SEE Pruning
-            if !board.in_check() && (1..=5).contains(&depth) && movecount > 1 && best_score > -MATE_VALUE + 500 {
-                let threshold = if m.is_capture() {
-                    -(depth as f32 * self.params.see_pruning_capture) as i32
-                } else {
-                    -(depth as f32 * self.params.see_pruning_quiet) as i32
-                };
-                if board.static_exchange_evaluation(m) < threshold {
-                    continue;
+            if !self.board[ply].in_check() && depth <= 2 && movecount > 1 && best > -MATE_VALUE + 500 {
+                if !m.is_capture() {
+                    let threshold = -(depth as f32 * 0.0) as i32;
+                    if self.board[ply].static_exchange_evaluation(*m) < threshold {
+                        continue;
+                    }
                 }
             }
 
-            // Late Move Pruning
-            let lmp_threshold =
-                self.params.lmp_base + (((self.params.lmp_mul * depth).pow(self.params.lmp_pow)) >> i32::from(!improving));
-            if !board.in_check()
-                && !m.is_capture()
-                && depth <= 3
-                && movecount >= lmp_threshold as usize
-                && best_score > -MATE_VALUE + 500
-            {
-                continue;
-            }
-
             let mut extension = 0;
-            let mut reduction = 1;
 
             // Singular extension: is the TT move uniquely good?
             if let Some(tt_entry) = tt_entry
                 && excluded_move.is_none()
                 && ply > 0
-                && Some(m) == tt_entry.m
+                && Some(*m) == tt_entry.m
             {
                 if depth >= 7 && matches!(tt_entry.flags, TtFlags::Exact | TtFlags::Lower) && tt_entry.score.abs() < 9500 {
                     let singular_beta = (i32::from(tt_entry.score) - depth * 2).max(-MATE_VALUE + 1);
                     let singular_depth = (depth - 1) / 2;
-                    let score = self.search(
-                        board,
-                        singular_depth,
-                        singular_beta - 1,
-                        singular_beta,
-                        pv,
-                        ply,
-                        keystack,
-                        Some(m),
-                        expected_cutnode,
-                    );
+                    let score = self.search(singular_depth, singular_beta - 1, singular_beta, ply, tt, Some(*m));
 
                     // Multicut: Another move failed high, so this position is very good; prune.
                     if score >= singular_beta && singular_beta >= beta {
-                        keystack.pop();
-                        self.eval.pop();
+                        self.keystack.pop();
                         return singular_beta;
                     }
 
+                    // The TT move seems uniquely good; extend.
                     if score < singular_beta {
-                        // The TT move seems uniquely good; extend.
                         extension += 1;
-                    } else if i32::from(tt_entry.score) >= beta {
+                    } else if tt_entry.score as i32 >= beta {
                         extension -= 1;
                     }
-                } else if depth <= 7 && !board.in_check() && eval_int <= alpha - 26 && tt_entry.flags == TtFlags::Lower {
-                    // Low-depth singular extension
+                // Low depth singular extension: Determine singularity by static eval vs alpha.
+                } else if !self.board[ply].in_check() && depth <= 7 && eval <= alpha - 25 && tt_entry.flags == TtFlags::Lower {
                     extension += 1;
                 }
             }
 
             self.nodes += 1;
-            if !expected_pvnode {
-                self.zw_nodes += 1;
+
+            self.path.push(Some((self.board[ply].piece_from_square(m.from()).unwrap(), *m)));
+
+            if self.board.len() <= ply + 1 {
+                self.board.push(self.board[ply].make(*m));
+            } else {
+                self.board[ply+1] = self.board[ply].make(*m);
             }
 
-            self.prefetch_tt(board, m);
-
-            self.path.push(Some((board.piece_from_square(m.from).unwrap(), m)));
-
-            // Late Move Reduction
-            if depth >= 3 && movecount >= 4 && !m.is_capture() {
-                let depth = (depth as f32).ln();
-                let movecount = (movecount as f32).ln();
-                reduction += (depth * movecount).mul_add(self.params.lmr_mul, self.params.lmr_base) as i32;
-                reduction -= i32::from(expected_pvnode);
-                // credit: adam
+            // Check extension: does this move give check?
+            if extension == 0 && self.board[ply+1].in_check() {
+                extension += 1;
             }
 
-            let mut child_pv = ArrayVec::new();
-            let child_board = board.make(m);
-            let mut score = 0;
+            let mut score;
+            if movecount == 0 {
+                score = -self.search(depth - 1 + extension, -beta, -alpha, ply + 1, tt, None);
+            } else {
+                // Late Move Reduction
+                let mut reduction = 1;
+                if depth >= 3 && movecount >= 4 && !m.is_capture() {
+                    let depth_f32 = (depth as f32).ln();
+                    let movecount = (movecount as f32).ln();
+                    reduction += (depth_f32 * movecount).mul_add(0.5, 1.0) as i32; // credit: adam
+                    reduction -= i32::from(expected_pvnode);
+                    reduction = reduction.clamp(1, depth - 1);   
+                }
 
-            if movecount > 0 {
-                score = -self.search(
-                    &child_board,
-                    depth - reduction + extension,
-                    -alpha - 1,
-                    -alpha,
-                    &mut child_pv,
-                    ply + 1,
-                    keystack,
-                    None,
-                    reduction > 1 || !expected_cutnode,
-                );
-            }
-            if movecount > 0 && reduction > 1 && score > alpha {
-                reduction = 1;
-                score = -self.search(
-                    &child_board,
-                    depth - reduction + extension,
-                    -alpha - 1,
-                    -alpha,
-                    &mut child_pv,
-                    ply + 1,
-                    keystack,
-                    None,
-                    !expected_cutnode,
-                );
-            }
-            if movecount == 0 || expected_pvnode && score > alpha {
-                reduction = 1;
-                score = -self.search(
-                    &child_board,
-                    depth - reduction + extension,
-                    -beta,
-                    -alpha,
-                    &mut child_pv,
-                    ply + 1,
-                    keystack,
-                    None,
-                    false,
-                );
+                score = -self.search(depth - reduction + extension, -alpha - 1, -alpha, ply + 1, tt, None);
+                if score > alpha && score < beta {
+                    score = -self.search(depth - 1 + extension, -beta, -alpha, ply + 1, tt, None);
+                }
             }
 
             self.path.pop();
 
-            if score > best_score {
-                best_move = Some(m);
-                best_score = score;
+            if score > best {
+                best = score;
+                best_move = Some(*m);
 
-                // Ensure we have *a move* even when failing high/low at root.
-                if ply == 0 {
-                    pv.set_len(0);
-                    pv.push(m);
-                    for m in child_pv {
-                        pv.push(m);
-                    }
+                self.pv[ply].clear();
+                self.pv[ply].push(*m);
+                let (this_pv, next_pv) = self.pv.split_at_mut(ply+1);
+                let (this_pv, next_pv) = (this_pv.last_mut().unwrap(), next_pv.first().unwrap());
+                this_pv.extend_from_slice(next_pv);
+            }
+
+            if self.index == 0 {
+                if let Some(node_limit) = self.node_limit && self.nodes + self.qnodes >= node_limit {
+                    self.stop.store(true, atomic::Ordering::Release);
+                }
+
+                if self.nodes.trailing_zeros() >= 10 && let Some(time) = self.stop_after && Instant::now() >= time {
+                    self.stop.store(true, atomic::Ordering::Release);
                 }
             }
 
-            if self.nodes.trailing_zeros() >= 10
-                && let Some(time) = self.stop_after
-                && Instant::now() >= time
-            {
+            if self.stop.load(atomic::Ordering::Acquire) {
                 if excluded_move.is_none() {
-                    keystack.pop();
-                    self.eval.pop();
+                    self.keystack.pop();
                 }
-                return best_score;
+                return best;
+            }
+
+            if score > alpha {
+                alpha = score;
+                raised_alpha = true;
             }
 
             if score >= beta {
-                let bonus = self.params.hist_bonus_mul * depth - self.params.hist_bonus_base;
-                let penalty = self.params.hist_pen_mul * depth - self.params.hist_pen_base;
-                let last_move = *self.path.last().unwrap_or(&None);
-                let last_last_move = *self.path.iter().rev().nth(1).unwrap_or(&None);
+                let bonus = 250 * depth - 300;
+                let last_m = *self.path.last().unwrap_or(&None);
+                let last_last_m = *self.path.iter().rev().nth(1).unwrap_or(&None);
                 if !m.is_capture() {
                     for (m, _) in moves.into_iter().take(movecount) {
                         if m.is_capture() {
                             continue;
                         }
-                        self.update_history(board, last_last_move, last_move, m, -penalty);
+                        self.update_history(ply, last_last_m, last_m, m, -bonus);
                     }
-                    self.update_history(board, last_last_move, last_move, m, bonus);
+                    self.update_history(ply, last_last_m, last_m, *m, bonus);
                 }
-
-                self.beta_cutoff_index += movecount as u64;
-                self.beta_cutoffs += 1;
 
                 break;
             }
-
-            if score > alpha {
-                alpha = score;
-                pv.set_len(0);
-                pv.push(m);
-                for m in child_pv {
-                    pv.push(m);
-                }
-                raised_lower_bound = true;
-            }
         }
 
         if excluded_move.is_none() {
-            keystack.pop();
-            self.eval.pop();
-        }
+            self.keystack.pop();
 
-        if excluded_move.is_none() {
             self.write_tt(
-                board,
+                tt,
+                &self.board[ply],
                 ply,
                 TtData {
                     m: best_move,
-                    score: best_score as i16,
-                    flags: if best_score >= beta {
+                    score: best as i16,
+                    flags: if best >= beta {
                         TtFlags::Lower
-                    } else if raised_lower_bound {
+                    } else if raised_alpha {
                         TtFlags::Exact
                     } else {
                         TtFlags::Upper
                     },
                     depth: depth as u8,
+                    eval: eval as i16,
                 },
             );
 
-            if !board.in_check()
+            if !self.board[ply].in_check()
                 && !best_move.unwrap().is_capture()
-                && (raised_lower_bound
-                    || (best_score >= beta && best_score >= eval_int)
-                    || (best_score <= alpha && best_score <= eval_int))
+                && (raised_alpha
+                    || (best >= beta && best >= eval)
+                    || (best <= alpha && best <= eval))
             {
-                self.update_corrhist(board, depth, best_score - eval_int);
+                self.update_corrhist(ply, depth, best - eval);
             }
         }
 
-        best_score
+        best
+    }
+}
+
+pub struct Search {
+    pool: rayon::ThreadPool,
+    threads: Vec<Thread>,
+    tt: Vec<TtEntry>,
+    stop: Arc<AtomicBool>,
+    stop_after: Option<Instant>,
+    pub params: SearchParams,
+}
+
+impl Search {
+    #[must_use]
+    pub fn new(
+        threads: usize,
+    ) -> Self {
+        let mut this = Self {
+            pool: rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap(),
+            threads: vec![],
+            tt: vec![],
+            stop: Arc::new(AtomicBool::new(false)),
+            stop_after: None,
+            params: SearchParams::default(),
+        };
+        this.threads = vec![Thread {
+                params: this.params.clone(),
+                nodes: 0,
+                qnodes: 0,
+                seldepth: 0,
+                board: vec![],
+                pv: vec![],
+                keystack: vec![],
+                stop: Arc::clone(&this.stop),
+                stop_after: None,
+                node_limit: None,
+                index: 0,
+                history: [[[0; _]; _]; _],
+                conthist: [[0; _]; _],
+                corrhist_p: [[0; _]; _],
+                corrhist_kbn: [[0; _]; _],
+                path: vec![],
+            }; threads];
+        this
+    }
+
+    pub fn prepare(&mut self, board: &Board, stop_after: Option<Instant>, node_limit: Option<u64>, keystack: &[u64]) {
+        self.stop_after = stop_after;
+        self.stop.store(false, atomic::Ordering::Release);
+        for (index, thread) in self.threads.iter_mut().enumerate() {
+            thread.params = self.params.clone();
+            thread.nodes = 0;
+            thread.qnodes = 0;
+            thread.seldepth = 0;
+            thread.stop_after = stop_after;
+            thread.node_limit = node_limit;
+            thread.board = vec![board.clone()];
+            thread.pv.clear();
+            thread.keystack = keystack.to_vec();
+            thread.index = index;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn search_root(
-        &mut self, board: &Board, depth: i32, lower_bound: i32, upper_bound: i32, pv: &mut ArrayVec<[Move; 64]>,
-        keystack: &mut Vec<u64>,
+    pub fn search(
+        &mut self, depth: i32, alpha: i32, beta: i32, pv: &mut Vec<Move>,
     ) -> i32 {
-        self.seldepth = 0;
-        let score = self.search(board, depth, lower_bound, upper_bound, pv, 0, keystack, None, false);
-        assert_eq!(self.path.len(), 0);
-        assert_eq!(self.eval.len(), 0);
-        score
+        let scores = self.pool.install(|| {
+            self.threads.par_iter_mut().map(|thread| {
+                thread.search(depth, alpha, beta, 0, &self.tt, None)
+            }).collect::<Vec<_>>()
+        });
+
+        *pv = self.threads[0].pv[0].clone();
+        scores[0]
+    }
+
+    pub fn allocate_tt(&mut self, megabytes: usize) {
+        let target_bytes = megabytes * 1024 * 1024;
+
+        let mut size = 1_usize;
+        loop {
+            if size > target_bytes {
+                break;
+            }
+            size *= 2;
+        }
+        size /= 2;
+        size /= std::mem::size_of::<TtEntry>();
+
+        self.tt = Vec::new();
+        self.tt.resize_with(size, Default::default);
     }
 
     #[must_use]
-    pub const fn nodes(&self) -> u64 {
-        self.nodes
+    pub fn nodes(&self) -> u64 {
+        self.threads.iter().map(|thread| thread.nodes).sum()
     }
 
     #[must_use]
-    pub const fn qnodes(&self) -> u64 {
-        self.qnodes
+    pub fn qnodes(&self) -> u64 {
+        self.threads.iter().map(|thread| thread.qnodes).sum()
     }
 
     #[must_use]
-    pub fn nullmove_success(&self) -> f64 {
-        100.0 * (self.nullmove_success as f64) / (self.nullmove_attempts as f64)
-    }
-
-    #[must_use]
-    pub fn beta_cutoff_index(&self) -> f64 {
-        (self.beta_cutoff_index as f64) / (self.beta_cutoffs as f64)
-    }
-
-    #[must_use]
-    pub fn q_beta_cutoff_index(&self) -> f64 {
-        (self.q_beta_cutoff_index as f64) / (self.q_beta_cutoffs as f64)
-    }
-
-    #[must_use]
-    pub fn zw_nodes(&self) -> f64 {
-        100.0 * (self.zw_nodes as f64) / (self.nodes as f64)
-    }
-
-    #[must_use]
-    pub fn zw_qnodes(&self) -> f64 {
-        100.0 * (self.zw_qnodes as f64) / (self.qnodes as f64)
-    }
-
-    #[must_use]
-    pub fn seldepth(&self) -> i32 {
-        self.seldepth
-    }
-
-    #[must_use]
-    pub fn tt_hit_rate(&self) -> f64 {
-        100.0 * (self.hash_hits as f64) / (self.hash_probes as f64)
-    }
-
-    #[must_use]
-    pub fn tt_cutoff_rate(&self) -> f64 {
-        100.0 * (self.hash_cutoffs as f64) / (self.hash_probes as f64)
+    pub fn seldepth(&self) -> usize {
+        self.threads.iter().map(|thread| thread.seldepth).max().unwrap()
     }
 }

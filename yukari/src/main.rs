@@ -9,11 +9,10 @@ use std::{
 };
 
 use colored::Colorize;
-use indicatif::{ParallelProgressIterator, ProgressStyle};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use indicatif::ProgressStyle;
 use tinyvec::ArrayVec;
 use yukari::{
-    self, Search, SearchParams, TtEntry, allocate_tt, datagen,
+    self, Search, SearchParams, datagen,
     engine::{TimeControl, TimeMode},
     is_repetition_draw,
     output::{self, Output},
@@ -39,7 +38,6 @@ pub enum Protocol {
 }
 
 /// The main engine state
-#[derive(Clone)]
 pub struct Yukari {
     board: Board,
     tc: TimeControl,
@@ -47,21 +45,17 @@ pub struct Yukari {
     nodes_per_second: Option<u32>,
     mode: Mode,
     keystack: Vec<u64>,
-    history: Box<[[[i16; 64]; 64]; 12]>,
-    corrhist_p: Box<[[i32; 16384]; 2]>,
-    corrhist_kbn: Box<[[i32; 16384]; 2]>,
-    corrhist_kqr: Box<[[i32; 16384]; 2]>,
-    corrhist_kqrbn_w: Box<[[i32; 16384]; 2]>,
-    corrhist_kqrbn_b: Box<[[i32; 16384]; 2]>,
-    conthist: Box<[[i16; 2 * 6 * 64]; 2 * 6 * 64]>,
+    search: Search,
+    threads: usize,
+    hash_megabytes: usize,
     params: SearchParams,
 }
 
 impl Yukari {
     /// Create a new copy of the engine, starting with the typical position and unused time controls
     #[must_use]
-    pub fn new() -> Self {
-        Self {
+    pub fn new(threads: usize, hash_megabytes: usize, params: SearchParams) -> Self {
+        let mut this = Self {
             // Using startpos fixes knights
             board: Board::startpos(),
             // Time controls are uninitialized
@@ -71,15 +65,14 @@ impl Yukari {
             // Normal move making is on by default
             mode: Mode::Normal,
             keystack: Vec::new(),
-            history: Box::new([[[0; 64]; 64]; 12]),
-            corrhist_p: Box::new([[0; 16384]; 2]),
-            corrhist_kbn: Box::new([[0; 16384]; 2]),
-            corrhist_kqr: Box::new([[0; 16384]; 2]),
-            corrhist_kqrbn_w: Box::new([[0; 16384]; 2]),
-            corrhist_kqrbn_b: Box::new([[0; 16384]; 2]),
-            conthist: Box::new([[0; 2 * 6 * 64]; 2 * 6 * 64]),
-            params: SearchParams::default(),
-        }
+            search: Search::new(threads),
+            threads,
+            hash_megabytes,
+            params: params.clone(),
+        };
+        this.search.allocate_tt(hash_megabytes);
+        this.search.params = params;
+        this
     }
 
     /// Sets the game board from FEN notation
@@ -121,110 +114,101 @@ impl Yukari {
         let mut moves = ArrayVec::from(moves);
         moves.set_len(0);
         self.board.generate(&mut moves);
-        moves.into_iter().find(|&m| m.from == from && m.dest == dest && m.prom == prom)
+        moves.into_iter().find(|&m| m.from() == from && m.dest() == dest && m.promotion_piece() == prom)
     }
 
     /// Real search, falls back to dumb search in extreme time constraints
-    pub fn search(&mut self, best_pv: &mut ArrayVec<[Move; 64]>, tt: &mut [TtEntry], protocol: Protocol) {
+    pub fn search(&mut self, best_pv: &mut Vec<Move>, protocol: Protocol) {
         let start = Instant::now();
         let (soft_limit, hard_limit) = self.tc.search_time();
         let mut soft_limit = start + Duration::from_secs_f32(soft_limit);
         let hard_limit = start + Duration::from_secs_f32(hard_limit);
 
         // while I love xboard protocol for its ease of parsing, the way fixed-nodes searching is implemented is *bad*.
-        let (nodes, stop_after) = if let Some(nodes_per_second) = self.nodes_per_second {
+        let (node_limit, stop_after) = if let Some(nodes_per_second) = self.nodes_per_second {
             let TimeMode::MoveTime(movetime) = self.tc.mode else {
                 panic!("nps is only supported in st mode");
             };
-            (Some(movetime * nodes_per_second / 1000), None)
+            (Some(u64::from(movetime * nodes_per_second / 1000)), None)
         } else {
             (None, Some(hard_limit))
         };
 
-        let mut s = Search::new(
-            stop_after,
-            tt,
-            &mut self.history,
-            &mut self.corrhist_p,
-            &mut self.corrhist_kbn,
-            &mut self.corrhist_kqr,
-            &mut self.corrhist_kqrbn_w,
-            &mut self.corrhist_kqrbn_b,
-            &mut self.conthist,
-            &self.params,
-        );
-        // clone another to use inside the loop
+        self.search.prepare(&self.board, stop_after, node_limit, &self.keystack);
+
         // Use a seperate backing data to record the current move set
-        let mut depth = 1;
+        let mut depth = 0;
         let mut score = 0;
-        let mut pv = ArrayVec::new();
+        let mut valid_score = 0;
+        let mut valid_depth = 0;
+
+        let mut pv = Vec::new();
         let max_depth = self.max_depth.unwrap_or(63);
-        while depth <= max_depth {
-            let mut lower_bound = 50;
-            let mut upper_bound = 50;
+        'depth_loop: while depth <= max_depth {
+            let mut lower_margin = 25;
+            let mut upper_margin = 25;
             loop {
-                pv.set_len(0);
-                let lower_window = score - lower_bound;
-                let upper_window = score + upper_bound;
+                let alpha = score - lower_margin;
+                let beta = score + upper_margin;
+                score = self.search.search(depth, alpha, beta, &mut pv);
+
+                // If we have bailed out stop the loop
+                if stop_after.is_some() && Instant::now() >= hard_limit {
+                    break 'depth_loop;
+                }
+
                 let output: &mut dyn output::Output = match protocol {
                     Protocol::Human => &mut output::Human,
                     Protocol::Xboard => &mut output::Xboard,
                     Protocol::Uci => &mut output::Uci,
                 };
-                score = s.search_root(&self.board, depth, lower_window, upper_window, &mut pv, &mut self.keystack);
 
-                // If we have bailed out stop the loop
-                if stop_after.is_some() && Instant::now() >= hard_limit {
-                    break;
-                }
-
-                if score <= lower_window {
-                    lower_bound *= 2;
+                if score <= alpha {
+                    lower_margin *= 2;
                     output.complete(
                         &self.board,
                         depth,
-                        s.seldepth(),
+                        self.search.seldepth(),
                         score,
                         Instant::now().duration_since(start),
-                        s.nodes() + s.qnodes(),
+                        self.search.nodes() + self.search.qnodes(),
                         &pv,
                         false,
                         false,
                     );
                     continue;
                 }
-                if score >= upper_window {
-                    upper_bound *= 2;
+
+                if score >= beta {
+                    upper_margin *= 2;
                     output.complete(
                         &self.board,
                         depth,
-                        s.seldepth(),
+                        self.search.seldepth(),
                         score,
                         Instant::now().duration_since(start),
-                        s.nodes() + s.qnodes(),
+                        self.search.nodes() + self.search.qnodes(),
                         &pv,
                         false,
                         true,
                     );
                     continue;
                 }
+
                 output.complete(
                     &self.board,
                     depth,
-                    s.seldepth(),
+                    self.search.seldepth(),
                     score,
                     Instant::now().duration_since(start),
-                    s.nodes() + s.qnodes(),
+                    self.search.nodes() + self.search.qnodes(),
                     &pv,
                     true,
                     false,
                 );
                 break;
             }
-            // If we have bailed out stop the loop
-            if stop_after.is_some() && Instant::now() >= hard_limit {
-                break;
-            }
+
             // Modify time to search based on best move stability.
             if matches!(self.tc.mode, TimeMode::Incremental { base: _, increment: _ }) && !pv.is_empty() && !best_pv.is_empty() {
                 if pv[0] == best_pv[0] {
@@ -238,29 +222,40 @@ impl Yukari {
 
             // If we have a pv that's not just empty from bailing out use that as our best moves
             best_pv.clone_from(&pv);
+            valid_score = score;
+            valid_depth = depth;
 
             if stop_after.is_some() && Instant::now() >= soft_limit {
                 break;
             }
-            if let Some(nodes) = nodes
-                && s.nodes() + s.qnodes() >= u64::from(nodes)
+            if let Some(node_limit) = node_limit
+                && self.search.nodes() + self.search.qnodes() >= node_limit
             {
                 break;
             }
             depth += 1;
         }
-        println!("# Avg AB cutoff index: {:.3}", s.beta_cutoff_index());
-        println!("# Avg QS cutoff index: {:.3}", s.q_beta_cutoff_index());
-        println!("# NMP success: {:.3}%", s.nullmove_success());
-        println!("# QS nodes: {} {:.3}%", s.qnodes(), (100 * s.qnodes()) as f64 / (s.nodes() as f64 + s.qnodes() as f64));
-        println!("# ZW AB nodes: {:.3}%", s.zw_nodes());
-        println!("# ZW QS nodes: {:.3}%", s.zw_qnodes());
-        println!("# TT hit rate: {:.3}%", s.tt_hit_rate());
-        println!("# TT cutoff rate: {:.3}%", s.tt_cutoff_rate());
-        println!("# Branching factor: {:.3}", ((s.nodes() + s.qnodes()) as f64).powf(1.0 / f64::from(depth)));
+
+        let output: &mut dyn output::Output = match protocol {
+            Protocol::Human => &mut output::Human,
+            Protocol::Xboard => &mut output::Xboard,
+            Protocol::Uci => &mut output::Uci,
+        };
+
+        output.complete(
+            &self.board,
+            valid_depth,
+            self.search.seldepth(),
+            valid_score,
+            Instant::now().duration_since(start),
+            self.search.nodes() + self.search.qnodes(),
+            best_pv,
+            true,
+            false,
+        );
     }
 
-    fn bench(&mut self, tt: &mut [TtEntry]) {
+    fn bench(&mut self) {
         let fens = [
             "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
             "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 10",
@@ -319,91 +314,75 @@ impl Yukari {
         for fen in fens {
             let board = Board::from_fen(fen).unwrap();
             let start = Instant::now();
-            for piece in 0..12 {
-                for from in 0..64 {
-                    for dest in 0..64 {
-                        self.history[piece][from][dest] = 0;
-                    }
-                }
-            }
-            let mut s = Search::new(
-                None,
-                tt,
-                &mut self.history,
-                &mut self.corrhist_p,
-                &mut self.corrhist_kbn,
-                &mut self.corrhist_kqr,
-                &mut self.corrhist_kqrbn_w,
-                &mut self.corrhist_kqrbn_b,
-                &mut self.conthist,
-                &self.params,
-            );
-            let mut keystack = Vec::new();
-            let mut pv = ArrayVec::new();
-            let mut score = 0;
-            let mut lower_bound = 50;
-            let mut upper_bound = 50;
-            loop {
-                pv.set_len(0);
-                let lower_window = score - lower_bound;
-                let upper_window = score + upper_bound;
-                let mut output = output::Xboard;
-                score = s.search_root(&board, 11, lower_window, upper_window, &mut pv, &mut keystack);
 
-                if score <= lower_window {
-                    lower_bound *= 2;
+            let keystack = Vec::new();
+            self.search.prepare(&board, None, None, &keystack);
+
+            let mut pv = Vec::new();
+
+            let mut score = 0;
+            for depth in 1..=9 {
+                let mut lower_margin = 25;
+                let mut upper_margin = 25;
+                loop {
+                    let alpha = score - lower_margin;
+                    let beta = score + upper_margin;
+                    score = self.search.search(depth, alpha, beta, &mut pv);
+
+                    let mut output = output::Xboard;
+
+                    if score <= alpha {
+                        lower_margin *= 2;
+                        output.complete(
+                            &self.board,
+                            depth,
+                            self.search.seldepth(),
+                            score,
+                            Instant::now().duration_since(start),
+                            self.search.nodes() + self.search.qnodes(),
+                            &pv,
+                            false,
+                            false,
+                        );
+                        continue;
+                    }
+
+                    if score >= beta {
+                        upper_margin *= 2;
+                        output.complete(
+                            &self.board,
+                            depth,
+                            self.search.seldepth(),
+                            score,
+                            Instant::now().duration_since(start),
+                            self.search.nodes() + self.search.qnodes(),
+                            &pv,
+                            false,
+                            true,
+                        );
+                        continue;
+                    }
+
                     output.complete(
-                        &board,
-                        11,
-                        s.seldepth(),
+                        &self.board,
+                        depth,
+                        self.search.seldepth(),
                         score,
                         Instant::now().duration_since(start),
-                        s.nodes() + s.qnodes(),
+                        self.search.nodes() + self.search.qnodes(),
                         &pv,
-                        false,
-                        false,
-                    );
-                    continue;
-                }
-                if score >= upper_window {
-                    upper_bound *= 2;
-                    output.complete(
-                        &board,
-                        11,
-                        s.seldepth(),
-                        score,
-                        Instant::now().duration_since(start),
-                        s.nodes() + s.qnodes(),
-                        &pv,
-                        false,
                         true,
+                        false,
                     );
-                    continue;
+                    break;
                 }
-                output.complete(
-                    &board,
-                    11,
-                    s.seldepth(),
-                    score,
-                    Instant::now().duration_since(start),
-                    s.nodes() + s.qnodes(),
-                    &pv,
-                    true,
-                    false,
-                );
-                break;
             }
-            nodes += s.nodes() + s.qnodes();
+
+            nodes += self.search.nodes() + self.search.qnodes();
         }
         let now = Instant::now().duration_since(start);
         let nps = (nodes as f64 / now.as_secs_f64()) as u64;
         println!("{nodes} nodes {nps} nps");
-    }
-}
-
-impl Default for Yukari {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -445,36 +424,49 @@ const YUKARI: &str = "
 ";
 
 fn run() -> io::Result<()> {
-    let mut engine = Yukari::new();
-    let mut tt = allocate_tt(16);
+    let mut engine = Yukari::new(1, 16, SearchParams::default());
     let mut protocol = Protocol::Human;
 
     for arg in std::env::args() {
         if arg == "bench" {
-            engine.bench(&mut tt);
+            engine.bench();
             return Ok(());
         }
         if arg == "datagen" {
             const GAMES: usize = 500_000;
-
-            // Try to avoid stack overflows.
-            rayon::ThreadPoolBuilder::new().stack_size(32 * 1024 * 1024).build_global().unwrap();
 
             let f = std::fs::File::options().create(true).append(true).open("games.viriformat").unwrap();
             let f = BufWriter::new(f);
             let f = Mutex::new(f);
 
             let positions = AtomicUsize::new(0);
+            let games_done = AtomicUsize::new(0);
             let style = ProgressStyle::with_template("[{bar:40.magenta/red}] {pos:>6}/{len:6} ({per_sec} games/s)")
                 .unwrap()
                 .progress_chars("━╸ ");
+            let progress = indicatif::ProgressBar::new(GAMES as u64).with_style(style);
 
-            (0..GAMES).into_par_iter().progress_with_style(style).for_each_init(
-                || datagen::DataGen::new(&f),
-                |dg, _| {
-                    positions.fetch_add(dg.play(1), Ordering::SeqCst);
-                },
-            );
+            let n_workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+
+            std::thread::scope(|s| {
+                for _ in 0..n_workers {
+                    std::thread::Builder::new()
+                        .stack_size(32 * 1024 * 1024)
+                        .spawn_scoped(s, || {
+                            let mut dg = datagen::DataGen::new(&f);
+                            loop {
+                                let g = games_done.fetch_add(1, Ordering::Relaxed);
+                                if g >= GAMES {
+                                    break;
+                                }
+                                positions.fetch_add(dg.play(1), Ordering::SeqCst);
+                                progress.inc(1);
+                            }
+                        })
+                        .unwrap();
+                }
+            });
+            progress.finish();
 
             println!("{GAMES} games, {} positions", positions.load(Ordering::SeqCst));
 
@@ -489,8 +481,8 @@ fn run() -> io::Result<()> {
         line.clear();
         let count = io::stdin().read_line(&mut line)?;
         if count == 0 {
-            println!("# got zero read");
-            continue;
+            // broken pipe? EOF??
+            break;
         }
         let trimmed = line.trim();
         let (mut cmd, mut args) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
@@ -506,7 +498,7 @@ fn run() -> io::Result<()> {
                 println!("id name Yukari 2025.11.1");
                 println!("id author Hannah Ravensloft");
                 println!("option name Hash type spin default 16 min 1 max 8192");
-                println!("option name Threads type spin default 1 min 1 max 1");
+                println!("option name Threads type spin default 1 min 1 max 256"); // do we even have a limit?
                 println!("uciok");
             }
             // This is where we send our features
@@ -527,28 +519,18 @@ fn run() -> io::Result<()> {
                 println!("feature memory=1");
                 // We support nps for fixed-nodes search.
                 println!("feature nps=1");
+                // We support multi-threading.
+                println!("feature smp=1");
                 // Tunables!
-                println!("feature option=\"RfpMarginBase -spin 3 0 100\"");
-                println!("feature option=\"RfpMarginMul -spin 36 0 1000\"");
-                println!("feature option=\"RazorMarginMul -spin 246 0 500\"");
-                println!("feature option=\"LmrBase -string 1.0186429\"");
-                println!("feature option=\"LmrMul -string 0.52110153\"");
-                println!("feature option=\"HistBonusBase -spin 260 0 500\"");
-                println!("feature option=\"HistBonusMul -spin 303 0 600\"");
-                println!("feature option=\"HistPenaltyBase -spin 251 0 500\"");
-                println!("feature option=\"HistPenaltyMul -spin 298 0 600\"");
-                println!("feature option=\"SeePruningCapture -string 0.4891615\"");
-                println!("feature option=\"SeePruningQuiet -string 0.006385347\"");
-                println!("feature option=\"CorrhistP -spin 1024 0 2048\"");
-                println!("feature option=\"CorrhistKQR -spin 1024 0 2048\"");
-                println!("feature option=\"CorrhistKBN -spin 1024 0 2048\"");
-                println!("feature option=\"CorrhistStmKQRBN -spin 1024 0 2048\"");
-                println!("feature option=\"CorrhistNstmKQRBN -spin 1024 0 2048\"");
+                engine.search.params.display_xboard();
+
                 println!("feature option=\"Hash -spin 16 1 8192\"");
-                println!("feature option=\"Threads -spin 1 1 1\"");
+                println!("feature option=\"Threads -spin 1 1 256\"");
                 // Communicate that feature reporting is done
                 println!("feature done=1");
             }
+            "spsa" => engine.search.params.display_openbench(),
+            "rust" => engine.search.params.display_rust(),
             // Directly update the engine's board from a FEN
             "setboard" => engine.set_board(args),
             "position" => {
@@ -609,7 +591,7 @@ fn run() -> io::Result<()> {
                 }
             }
             // Reset the entire state of the engine
-            "new" | "ucinewgame" => engine = Yukari::new(),
+            "new" | "ucinewgame" => engine = Yukari::new(engine.threads, engine.hash_megabytes, engine.params.clone()),
             // Parse our two time controls from the whole commmand lines
             // TODO: This is rather xboard specific
             "level" => engine.parse_tc(trimmed),
@@ -618,7 +600,16 @@ fn run() -> io::Result<()> {
             // Allocate a hash table.
             "memory" => {
                 let megabytes = args.parse::<usize>().unwrap();
-                tt = allocate_tt(megabytes);
+                engine.search.allocate_tt(megabytes);
+                engine.hash_megabytes = megabytes;
+            }
+            // Set number of threads.
+            "cores" => {
+                let cores = args.parse::<usize>().unwrap();
+                engine.search = Search::new(cores);
+                engine.search.allocate_tt(engine.hash_megabytes);
+                engine.search.params = engine.params.clone();
+                engine.threads = cores;
             }
             "option" => {
                 let (name, value) = args.split_once('=').unwrap();
@@ -626,28 +617,20 @@ fn run() -> io::Result<()> {
                     // UCIism. grumble grumble.
                     let value = value.parse::<i32>().unwrap();
                     if value >= 1 {
-                        tt = allocate_tt(value as usize);
+                        engine.search.allocate_tt(value as usize);
+                        engine.hash_megabytes = value as usize;
                     }
                 }
-                match name {
-                    "RfpMarginBase" => engine.params.rfp_margin_base = value.parse::<i32>().unwrap(),
-                    "RfpMarginMul" => engine.params.rfp_margin_mul = value.parse::<i32>().unwrap(),
-                    "RazorMarginMul" => engine.params.razor_margin_mul = value.parse::<i32>().unwrap(),
-                    "LmrBase" => engine.params.lmr_base = value.parse::<f32>().unwrap(),
-                    "LmrMul" => engine.params.lmr_mul = value.parse::<f32>().unwrap(),
-                    "HistBonusBase" => engine.params.hist_bonus_base = value.parse::<i32>().unwrap(),
-                    "HistBonusMul" => engine.params.hist_bonus_mul = value.parse::<i32>().unwrap(),
-                    "HistPenaltyBase" => engine.params.hist_pen_base = value.parse::<i32>().unwrap(),
-                    "HistPenaltyMul" => engine.params.hist_pen_mul = value.parse::<i32>().unwrap(),
-                    "SeePruningCapture" => engine.params.see_pruning_capture = value.parse::<f32>().unwrap(),
-                    "SeePruningQuiet" => engine.params.see_pruning_quiet = value.parse::<f32>().unwrap(),
-                    "CorrhistP" => engine.params.corrhist_p_weight = value.parse::<i32>().unwrap(),
-                    "CorrhistKQR" => engine.params.corrhist_kqr_weight = value.parse::<i32>().unwrap(),
-                    "CorrhistKBN" => engine.params.corrhist_kbn_weight = value.parse::<i32>().unwrap(),
-                    "CorrhistStmKQRBN" => engine.params.corrhist_kqrbn_stm_weight = value.parse::<i32>().unwrap(),
-                    "CorrhistNstmKQRBN" => engine.params.corrhist_kqrbn_nstm_weight = value.parse::<i32>().unwrap(),
-                    _ => (),
+                if name == "Threads" {
+                    // UCIism. grumble grumble.
+                    let value = value.parse::<usize>().unwrap();
+                    engine.search = Search::new(value);
+                    engine.search.allocate_tt(engine.hash_megabytes);
+                    engine.search.params = engine.params.clone();
+                    engine.threads = value;
                 }
+                engine.search.params.parse(name, value);
+                engine.params = engine.search.params.clone();
             }
             "setoption" => {
                 let (name, args) = args.split_once(' ').unwrap_or((args, ""));
@@ -658,16 +641,18 @@ fn run() -> io::Result<()> {
                 let (value, _) = args.split_once(' ').unwrap_or((args, ""));
                 let value = value.parse::<i32>().unwrap();
                 match name {
-                    "RfpMarginBase" => engine.params.rfp_margin_base = value,
-                    "RfpMarginMul" => engine.params.rfp_margin_mul = value,
-                    "LmrBase" => engine.params.lmr_base = (value as f32) / 100.0,
-                    "LmrMul" => engine.params.lmr_mul = (value as f32) / 1000.0,
-                    "HistBonusBase" => engine.params.hist_bonus_base = value,
-                    "HistBonusMul" => engine.params.hist_bonus_mul = value,
-                    "HistPenaltyBase" => engine.params.hist_pen_base = value,
-                    "HistPenaltyMul" => engine.params.hist_pen_mul = value,
-                    "Hash" if value >= 1 => tt = allocate_tt(value as usize), // UCIism. grumble grumble.
-                    "Threads" => (),                                          // UCIism, grumble grumble.
+                    "Hash" if value >= 1 => {
+                        // UCIism. grumble grumble.
+                        engine.search.allocate_tt(value as usize);
+                        engine.hash_megabytes = value as usize;
+                    }
+                    "Threads" => {
+                        // UCIism, grumble grumble.
+                        engine.search = Search::new(value as usize);
+                        engine.search.allocate_tt(engine.hash_megabytes);
+                        engine.search.params = engine.params.clone();
+                        engine.threads = value as usize;
+                    }
                     _ => (),
                 }
             }
@@ -751,8 +736,8 @@ fn run() -> io::Result<()> {
                 }
                 engine.mode = Mode::Normal;
                 // When we get go we should make a move immediately
-                let mut pv = ArrayVec::new();
-                engine.search(&mut pv, &mut tt, protocol);
+                let mut pv = Vec::new();
+                engine.search(&mut pv, protocol);
                 // Choose the top move
                 let m = pv[0];
                 if uci {
@@ -806,8 +791,8 @@ fn run() -> io::Result<()> {
                             engine.keystack.push(engine.board.hash());
                             // Find the next move to make
                             // TODO: Cleanups
-                            let mut pv = ArrayVec::new();
-                            engine.search(&mut pv, &mut tt, protocol);
+                            let mut pv = Vec::new();
+                            engine.search(&mut pv, protocol);
                             // Choose the top move
                             let m = pv[0];
                             // We must actually make the move locally too
@@ -841,10 +826,7 @@ fn run() -> io::Result<()> {
 
 fn main() -> io::Result<()> {
     // Hack to deal with Windows' small stack sizes:
-    let child = std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(run)
-        .unwrap();
+    let child = std::thread::Builder::new().stack_size(8 * 1024 * 1024).spawn(run).unwrap();
 
     // Wait for thread to join
     child.join().unwrap()

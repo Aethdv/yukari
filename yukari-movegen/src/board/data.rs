@@ -209,6 +209,7 @@ impl BoardData {
                 self.eval.add_threat(
                     self.piece_from_bit(attack),
                     self.square_of_piece(attack),
+                    Some(piece),
                     square,
                     attack.colour(),
                     Some(piece_index.colour()),
@@ -248,6 +249,7 @@ impl BoardData {
                 self.eval.remove_threat(
                     self.piece_from_bit(attack),
                     self.square_of_piece(attack),
+                    Some(piece),
                     square,
                     attack.colour(),
                     Some(piece_index.colour()),
@@ -261,7 +263,7 @@ impl BoardData {
     pub fn rebuild_accumulators(&mut self) {
         let white_king = self.king_square(Colour::White);
         let black_king = self.king_square(Colour::Black);
-        //println!("===");
+        println!("===");
         self.eval = Eval::new();
         for square in 0..64 {
             let square = unsafe { Square::from_u8_unchecked(square) };
@@ -271,6 +273,7 @@ impl BoardData {
                 self.eval.add_threat(
                     self.piece_from_bit(attack),
                     self.square_of_piece(attack),
+                    Some(self.piece_from_bit(square_piece_index)),
                     square,
                     attack.colour(),
                     self.colour_from_square(square),
@@ -306,6 +309,7 @@ impl BoardData {
                 self.eval.add_threat_for_acc(
                     self.piece_from_bit(attack),
                     self.square_of_piece(attack),
+                    self.piece_from_bit(square_piece_index),
                     square,
                     attack.colour(),
                     self.colour_from_square(square),
@@ -331,6 +335,7 @@ impl BoardData {
             self.eval.remove_threat_for_acc(
                 self.piece_from_bit(attack),
                 self.square_of_piece(attack),
+                piece,
                 from_square,
                 attack.colour(),
                 self.colour_from_square(to_square),
@@ -345,6 +350,7 @@ impl BoardData {
             self.eval.add_threat_for_acc(
                 self.piece_from_bit(attack),
                 self.square_of_piece(attack),
+                piece,
                 to_square,
                 attack.colour(),
                 self.colour_from_square(to_square),
@@ -398,6 +404,7 @@ impl BoardData {
             self.eval.remove_threat(
                 self.piece_from_bit(attack),
                 self.square_of_piece(attack),
+                Some(piece),
                 from_square,
                 attack.colour(),
                 self.colour_from_square(to_square),
@@ -411,6 +418,7 @@ impl BoardData {
             self.eval.add_threat(
                 self.piece_from_bit(attack),
                 self.square_of_piece(attack),
+                Some(piece),
                 to_square,
                 attack.colour(),
                 self.colour_from_square(to_square),
@@ -486,6 +494,7 @@ impl BoardData {
             self.eval.remove_threat(
                 piece,
                 square,
+                self.piece_from_square(dest),
                 dest,
                 bit.colour(),
                 self.index[dest].map(PieceIndex::colour),
@@ -503,10 +512,12 @@ impl BoardData {
         let white_king = self.king_square(Colour::White);
         let black_king = self.king_square(Colour::Black);
 
+        let piecemask = &self.piecemask;
         let update = |bitlist: &mut BitlistArray, index: &PieceIndexArray, eval: &mut Eval, dest: Square| {
             debug_assert!(dest != square);
             bitlist.add_piece(dest, bit);
-            eval.add_threat(piece, square, dest, bit.colour(), index[dest].map(PieceIndex::colour), white_king, black_king);
+            let to_piece = index[dest].and_then(|pi| piecemask.piece(pi));
+            eval.add_threat(piece, square, to_piece, dest, bit.colour(), index[dest].map(PieceIndex::colour), white_king, black_king);
         };
 
         let slide = |bitlist: &mut BitlistArray, eval: &mut Eval, index: &PieceIndexArray, dir: Direction| {
@@ -613,6 +624,7 @@ impl BoardData {
                     self.eval.add_threat(
                         self.piece_from_bit(piece),
                         self.square_of_piece(piece),
+                        self.piece_from_square(dest),
                         dest,
                         piece.colour(),
                         self.colour_from_square(dest),
@@ -630,6 +642,7 @@ impl BoardData {
                     self.eval.remove_threat(
                         self.piece_from_bit(piece),
                         self.square_of_piece(piece),
+                        self.piece_from_square(dest),
                         dest,
                         piece.colour(),
                         to_colour,
