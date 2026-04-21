@@ -632,17 +632,21 @@ impl BoardData {
                         black_king,
                     );
                 } else {
-                    let to_colour = from_square.map_or_else(
-                        || self.colour_from_square(dest),
+                    let (to_piece, to_colour) = from_square.map_or_else(
+                        || (self.piece_from_square(dest), self.colour_from_square(dest)),
                         |from_square| {
-                            if from_square == dest { self.colour_from_square(square) } else { self.colour_from_square(dest) }
+                            if from_square == dest {
+                                (self.piece_from_square(square), self.colour_from_square(square))
+                            } else {
+                                (self.piece_from_square(dest), self.colour_from_square(dest))
+                            }
                         },
                     );
                     self.bitlist.remove_piece(dest, piece);
                     self.eval.remove_threat(
                         self.piece_from_bit(piece),
                         self.square_of_piece(piece),
-                        self.piece_from_square(dest),
+                        to_piece,
                         dest,
                         piece.colour(),
                         to_colour,
