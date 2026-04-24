@@ -188,15 +188,16 @@ impl ViriFormat {
 }
 
 pub struct DataGen<'a, T: Write> {
-    f:      &'a Mutex<T>,
-    search: search::Search,
-    rng:    rand::rngs::ThreadRng,
-    pv:     Vec<Move>,
+    f:          &'a Mutex<T>,
+    search:     search::Search,
+    rng:        rand::rngs::ThreadRng,
+    pv:         Vec<Move>,
+    scratch_pv: Vec<Move>,
 }
 
 impl<'a, T: Write> DataGen<'a, T> {
     pub fn new(f: &'a Mutex<T>) -> DataGen<'a, T> {
-        let mut this = Self { f, search: search::Search::new(1), rng: rand::rng(), pv: Vec::new() };
+        let mut this = Self { f, search: search::Search::new(1), rng: rand::rng(), pv: Vec::new(), scratch_pv: Vec::new() };
         this.search.allocate_tt(16);
         this
     }
@@ -252,13 +253,20 @@ impl<'a, T: Write> DataGen<'a, T> {
                 (-i32::MAX, i32::MAX)
             };
 
-            self.pv.clear();
-            let mut s = self.search.search(depth, alpha, beta, &mut self.pv);
+            self.scratch_pv.clear();
+            let mut s = self.search.search(depth, alpha, beta, &mut self.scratch_pv);
             if s <= alpha || s >= beta {
-                self.pv.clear();
-                s = self.search.search(depth, -i32::MAX, i32::MAX, &mut self.pv);
+                self.scratch_pv.clear();
+                s = self.search.search(depth, -i32::MAX, i32::MAX, &mut self.scratch_pv);
             }
-            score = s;
+
+            // Only commit a completed iteration: a mid-search bail leaves
+            // scratch_pv empty and s is a bogus bound, so keep the previous
+            // depth's PV and score instead of overwriting with garbage.
+            if !self.scratch_pv.is_empty() {
+                self.pv.clone_from(&self.scratch_pv);
+                score = s;
+            }
 
             if let Some(cap) = node_cap
                 && self.search.nodes() + self.search.qnodes() > cap
