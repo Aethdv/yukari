@@ -625,43 +625,50 @@ impl BoardData {
             let Some(direction) = attacker.direction(square16x8) else {
                 continue;
             };
+            let from_colour = piece.colour();
+            let from_piece = self.piece_from_bit(piece);
+            let from_square_of_piece = self.square_of_piece(piece);
             for dest in square16x8.ray_attacks(direction) {
                 if add {
                     self.bitlist.add_piece(dest, piece);
-                    self.eval.add_threat(
-                        self.piece_from_bit(piece),
-                        self.square_of_piece(piece),
-                        self.piece_from_square(dest),
-                        dest,
-                        piece.colour(),
-                        self.colour_from_square(dest),
-                        white_king,
-                        black_king,
-                    );
+                    if self.index[dest].is_some() {
+                        self.eval.add_threat(
+                            from_piece,
+                            from_square_of_piece,
+                            self.piece_from_square(dest),
+                            dest,
+                            from_colour,
+                            self.colour_from_square(dest),
+                            white_king,
+                            black_king,
+                        );
+                    }
                 } else {
-                    let to_colour = from_square.map_or_else(
-                        || self.colour_from_square(dest),
-                        |from_square| {
-                            if from_square == dest { self.colour_from_square(square) } else { self.colour_from_square(dest) }
-                        },
-                    );
-                    let to_piece = from_square.map_or_else(
-                        || self.piece_from_square(dest),
-                        |from_square| {
-                            if from_square == dest { self.piece_from_square(square) } else { self.piece_from_square(dest) }
-                        },
-                    );
                     self.bitlist.remove_piece(dest, piece);
-                    self.eval.remove_threat(
-                        self.piece_from_bit(piece),
-                        self.square_of_piece(piece),
-                        to_piece,
-                        dest,
-                        piece.colour(),
-                        to_colour,
-                        white_king,
-                        black_king,
-                    );
+                    if self.index[dest].is_some() {
+                        let to_colour = from_square.map_or_else(
+                            || self.colour_from_square(dest),
+                            |from_square| {
+                                if from_square == dest { self.colour_from_square(square) } else { self.colour_from_square(dest) }
+                            },
+                        );
+                        let to_piece = from_square.map_or_else(
+                            || self.piece_from_square(dest),
+                            |from_square| {
+                                if from_square == dest { self.piece_from_square(square) } else { self.piece_from_square(dest) }
+                            },
+                        );
+                        self.eval.remove_threat(
+                            from_piece,
+                            from_square_of_piece,
+                            to_piece,
+                            dest,
+                            from_colour,
+                            to_colour,
+                            white_king,
+                            black_king,
+                        );
+                    }
                 }
 
                 if self.index[dest].is_some() {
